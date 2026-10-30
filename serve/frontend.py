@@ -846,9 +846,10 @@ def function_end(text: str) -> int:
 _JSON_FENCE = re.compile(r"```[ \t]*(?:json)?[ \t]*\r?\n\s*", re.I)
 
 
-def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
+def json_tool_call(body: str, schemas: dict, declared=None) -> ToolCall | None:
     """`{"name": N, "arguments": {...}}` (or "parameters", or the arguments as a JSON string) of a declared tool -> its
-    call; anything else -> None.  #2037: the object may sit in a Markdown fence (```json ... ```)."""
+    call; anything else -> None.  `declared` maps a name to the declared tool it means (OutputParser's).  #2037: the
+    object may sit in a Markdown fence (```json ... ```)."""
     body = body.strip()
     m = _JSON_FENCE.match(body)
     if m:
@@ -858,7 +859,10 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
         obj = json.loads(body)
     except ValueError:
         return None
-    if not isinstance(obj, dict) or not isinstance(obj.get("name"), str) or obj["name"] not in schemas:
+    if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+        return None
+    name = declared(obj["name"]) if declared else obj["name"]
+    if name not in schemas:
         return None
     args = obj.get("arguments", obj.get("parameters", {}))
     if isinstance(args, str):
@@ -868,7 +872,7 @@ def json_tool_call(body: str, schemas: dict) -> ToolCall | None:
             return None
     if args is None:
         args = {}
-    return ToolCall(name=obj["name"], arguments=args) if isinstance(args, dict) else None
+    return ToolCall(name=name, arguments=args) if isinstance(args, dict) else None
 
 
 def parse_tool_call(body: str, schema: dict | None = None) -> ToolCall:
@@ -918,21 +922,34 @@ class OutputParser:
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
         # #804/#3075: in the answer too, a call counts only for a tool the request declared.  With tools declared a
-        # call for another name stays text (the Responses spelling `namespace__tool` of a `namespace.tool` counts as
-        # that tool); `declared_only` extends the rule to a request that declared none (Chat Completions, Anthropic:
+        # call for another name stays text (a name that means one declared tool counts as that tool, see _declared);
+        # `declared_only` extends the rule to a request that declared none (Chat Completions, Anthropic:
         # the client has no tool to run).  The Responses route leaves it off: a Codex compaction request keeps its
         # conversation's tools in the prompt only, and its calls come back as before.
         self.declared_only = declared_only
-        # PR #3556: the native namespace__member spelling of a declared namespace.member tool is accepted without advertising a
-        # duplicate tool.  Only an unambiguous alias counts (two namespaces can end in the same member), and an exactly declared
-        # name always wins over an alias.
-        aliases = {}
+        # A declared tool is also called by names that mean it and no other, without advertising a duplicate tool: the
+        # native spelling `namespace__member` of a declared `namespace.member` (PR #3556), and the last `__`-separated
+        # segment of that spelling (an MCP client's `mcp__server__tool` is `tool` in the prompt the model reads), alone
+        # or after another prefix (`mcp__other__tool`).  Only an unambiguous alias counts (two namespaces can end in the
+        # same member), and an exactly declared name always wins over an alias.
+        aliases, tails = {}, {}
         for name in self.schemas:
-            if isinstance(name, str) and "." in name:
+            if not isinstance(name, str):
+                continue
+            native = name
+            if "." in name:
                 namespace, member = name.rsplit(".", 1)
-                aliases.setdefault(f"{namespace}__{member}", set()).add(name)
+                native = f"{namespace}__{member}"
+                aliases.setdefault(native, set()).add(name)
+            tail = native.rsplit("__", 1)[-1]
+            if tail:
+                tails.setdefault(tail, set()).add(name)
+        self.tails = {tail: next(iter(names)) for tail, names in tails.items() if len(names) == 1}
         self.aliases = {alias: next(iter(names)) for alias, names in aliases.items()
                         if len(names) == 1 and alias not in self.schemas}
+        for tail, name in self.tails.items():
+            if tail not in self.schemas:
+                self.aliases.setdefault(tail, name)
         self.unread = 0              # #3441: `<tool_call>` blocks that opened like a call and were returned as text
         self.unread_names: list[str] = []   # the names (first few) of those that named a tool the request did not declare
         # stream_tools: a tool call is also reported while it is being written - "tool_start" (its name and id) as
@@ -969,12 +986,23 @@ class OutputParser:
         self.fence, self.line, self.ticks = snap
         return ok
 
+    def _declared(self, name: str) -> str:
+        """The declared tool a call for `name` means: `name` itself when declared, else the one tool its alias means
+        (see __init__); `name` unchanged when it means none."""
+        if name in self.schemas:
+            return name
+        if name in self.aliases:
+            return self.aliases[name]
+        if "__" in name:
+            return self.tails.get(name.rsplit("__", 1)[-1], name)
+        return name
+
     def _callable(self, name: str) -> bool:
-        """#3075: may a call for `name` be a call?  A tool the request declared (or its Responses spelling); with
+        """#3075: may a call for `name` be a call?  A tool the request declared (or a name that means one); with
         none declared, only where `declared_only` is off."""
         if not self.schemas:
             return not self.declared_only
-        return name in self.schemas or name in self.aliases
+        return self._declared(name) in self.schemas
 
     def _loose_open(self, after: str):
         """#3441: `after` (text after a `<tool_call>`, whitespace dropped) opens a call in a drifted form that names a
@@ -991,6 +1019,8 @@ class OutputParser:
                 return "wait"
             if any(k.startswith(bare) for k in list(self.schemas) + list(self.aliases) if isinstance(k, str)):
                 return "wait"
+            if "__" in bare and any(t.startswith(bare.rsplit("__", 1)[-1]) for t in self.tails):
+                return "wait"
         return None
 
     def _follower(self, after: str) -> str:
@@ -1002,7 +1032,7 @@ class OutputParser:
             gt = after.find(">")
             if gt < 0:
                 return "wait" if "\n" not in after else "text"
-            return "param" if after[len(PARAM_START):gt] in self.schemas else "text"
+            return "param" if self._declared(after[len(PARAM_START):gt]) in self.schemas else "text"
         if after.startswith("{"):
             return "json" if self.schemas else "text"
         if after.startswith("```") or (after and "```".startswith(after)):
@@ -1027,7 +1057,7 @@ class OutputParser:
                 gt = self.buf.find(">", p)
                 raw_name = self.buf[p + len(FUNC_START):gt if gt >= 0 else len(self.buf)]
                 name = raw_name.strip()
-                name = self.aliases.get(name, name)
+                name = self._declared(name)
                 if gt < 0 and re.fullmatch(r"\s*[^<>\s]*\s*", raw_name):
                     return p, False
                 if gt >= 0 and name in self.schemas:
@@ -1164,7 +1194,7 @@ class OutputParser:
                     return out
                 raw_name = rest[a + 10:b]
                 name = raw_name.strip()
-                name = self.aliases.get(name, name)
+                name = self._declared(name)
                 if raw_name != raw_name.strip() and name not in self.schemas:
                     return out
                 self.scall = ToolCall(name=name, arguments={})
@@ -1285,7 +1315,7 @@ class OutputParser:
                     call = None
                     try:
                         name = body[:end].strip()[len("<function="):].split(">", 1)[0].strip()
-                        name = self.aliases.get(name, name)
+                        name = self._declared(name)
                         if name in self.schemas:
                             call = parse_tool_call(body[:end], self.schemas.get(name))
                             call.name = name
@@ -1448,7 +1478,7 @@ class OutputParser:
                 if is_call:
                     raw_name = is_call.group(1)
                     name = raw_name.strip()
-                    name = self.aliases.get(name, name)
+                    name = self._declared(name)
                     if raw_name != raw_name.strip() and name not in self.schemas:
                         is_call = None     # only declared names gain whitespace normalization
                 is_partial = FUNC_START.startswith(after) or re.fullmatch(r"<function=\s*[^<>\s]*\s*", after)
@@ -1493,7 +1523,7 @@ class OutputParser:
                 i = self.buf.find(CALL_END)
                 if i < 0:
                     return out
-                call = json_tool_call(self.buf[:i].strip(), self.schemas)
+                call = json_tool_call(self.buf[:i].strip(), self.schemas, self._declared)
                 if call is None:
                     out.append(Event("content", self._track(CALL_START + self.buf[:i + len(CALL_END)])))
                 else:
@@ -1585,7 +1615,7 @@ class OutputParser:
         parse is the text it is instead of an error that ends the request."""
         raw_name = body.strip()[len(FUNC_START):].split(">", 1)[0]
         name = raw_name.strip()
-        name = self.aliases.get(name, name)
+        name = self._declared(name)
         bare, self.bare = self.bare, False
         try:
             if raw_name != raw_name.strip() and name not in self.schemas:

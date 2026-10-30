@@ -481,9 +481,13 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 - With `"stream": true` everything arrives as it is made: thinking, answer and tool calls (the tool's name first, then its
   arguments piece by piece). While the model reads a long prompt the stream sends keep-alives. The server window prints progress
   every 15 s and `GET /status` says what it is doing. Closing the connection or pressing stop in your app stops the model.
-- A tool call counts only when it names a tool the request declared. Any other call, or any call in a request that declared
-  no tools, comes back as the text it was written as. A call whose envelope drifted by a token (`<=NAME>`, `<function:NAME>`
-  or `<NAME>` instead of `<function=NAME>`) is read as the call when NAME is a declared tool.
+- A tool call counts only when it names a tool the request declared, or a name that means exactly one declared tool, and it
+  is reported under the declared name. A declared `namespace.member` is also written `namespace__member`; a declared name's
+  last `__`-separated segment in that spelling means it alone (`web_fetch` for `mcp__web__web_fetch`) or after any other
+  `__` prefix (`mcp__bmo__web_fetch`). A declared name always means itself, and a name two declared tools could mean (two
+  tools ending in the same segment) means neither. Any other call, or any call in a request that declared no tools, comes
+  back as the text it was written as. A call whose envelope drifted by a token (`<=NAME>`, `<function:NAME>` or `<NAME>`
+  instead of `<function=NAME>`) is read as the call when NAME means a declared tool.
 - JSON output: `response_format: {"type":"json_object"}` or `{"type":"json_schema", ...}` on `/v1/chat/completions`. The schema
   must accept only JSON objects at its root (`"type":"object"`, or `anyOf`/`oneOf` of object schemas). Local `#` references
   work and remote ones are refused. This is schema prompting followed by server validation, not grammar-constrained
