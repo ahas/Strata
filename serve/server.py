@@ -107,6 +107,18 @@ def popen(what: str, args: list, role: str = "engine", **kw):
 # How long close() gives the engine at each step of ending it (seconds). Module values so that a test can shorten them.
 ENGINE_QUIT_WAIT_S, ENGINE_TERM_WAIT_S, ENGINE_KILL_WAIT_S = 20, 5, 20
 
+# "stop_session" (opt-in): the engine ignores SIGTERM. A stop sent to every process of the server's group or unit (systemd's
+# KillMode=control-group) then ends the server alone, which saves the live session and ends the engine itself; the
+# engine still dies with the server (serve/lifeline.py) and close() still kills it. main() sets it before the engine starts.
+ENGINE_IGNORES_TERM = False
+# How long a stop waits for the running requests it cancelled before saving the live session without them (seconds).
+STOP_SAVE_DRAIN_S = 30.0
+
+
+def ignore_term() -> None:
+    """In the engine's child, before exec: SIGTERM ignored, which the exec keeps."""
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
 
 def rttime_limit_note() -> str:
     """#3238: Linux only. A hard RLIMIT_RTTIME that is not unlimited (PipeWire's client module sets it to 0 when rtkit is
@@ -1038,6 +1050,9 @@ class StrataEngine:
             pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
             print(f"[strata] engine priority: nice +{nice} (this PC has built-in Radeon graphics that usually draw the desktop; "
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
+        if ENGINE_IGNORES_TERM and os.name != "nt":      # stop_session: a stop reaches the server, which saves first
+            then = pin.get("preexec_fn")
+            pin["preexec_fn"] = lambda: (then() if then else None, ignore_term())[0]
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         spawned_at = time.monotonic()
         try:
@@ -3805,6 +3820,21 @@ def slot_filename_problem(name) -> str | None:
     return None
 
 
+def stop_session_name(value, slot_save_path: bool) -> str | None:
+    """--stop-session / the config's "stop_session": a session file name in the slot save path, or None when off.
+    ValueError for a name a session file cannot have, or without a slot save path."""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"stop_session must be a session file name (a string), not {value!r}")
+    why = slot_filename_problem(value)
+    if why:
+        raise ValueError(f"stop_session {why}")
+    if not slot_save_path:
+        raise ValueError("stop_session needs slot_save_path (--slot-save-path): the directory the session is saved in")
+    return value
+
+
 def slot_save_dir(value, base: str | None = None) -> str:
     """The slot save path as one absolute, normalized directory (relative to `base`, else the server's working
     directory), created private to this user when missing.  ValueError for anything else."""
@@ -3838,6 +3868,7 @@ class Service:
         self.keep_awake = None                        # #1727 (opt-in): serve.keepawake.KeepAwake, the config's "prevent_sleep"
         self.fifo = threading.Lock()
         self.slot_save_path = None                    # --slot-save-path: /slots/0?action=save|restore (off when None)
+        self.stop_session = None                      # --stop-session: the file in slot_save_path a stop saves to, a start restores
         self.embeddings = threading.local()           # the current request's image embeddings file (GENI)
         self.api_key = ""                              # when set, /v1/* needs it (Bearer or x-api-key)
         # #458 (opt-in, the config's "effort_position": "end"): a non-default reasoning effort goes in a short system
@@ -4121,6 +4152,61 @@ class Service:
                          "timings": {"save_ms": r["ms"]}}
         return 200, {"id_slot": 0, "filename": filename, "n_restored": r["tokens"], "n_read": r["bytes"],
                      "timings": {"restore_ms": r["ms"]}}
+
+    def save_stop_session(self, wait_s: float = STOP_SAVE_DRAIN_S) -> str:
+        """--stop-session: the live session saved as the server stops, after no new request is admitted and the running
+        ones are cancelled (their read prompt and output stay in the session).  A stop that saves nothing removes the
+        file an earlier stop left, unless the failed save already replaced it, so a start never restores a session
+        older than the one the slot last held.  -> one line saying what happened ("" when off); never raises."""
+        name = self.stop_session
+        if not name or not self.slot_save_path:
+            return ""
+        deadline = time.monotonic() + max(0.0, wait_s)
+        while self.begin_drain():                   # a request admitted after the first cancel is cancelled too
+            self.cancel_owned_requests()
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return (f"the session was not saved for the next start: requests still ran {wait_s:g} s after they "
+                        "were cancelled")
+            self.wait_for_drain(min(1.0, left))
+        try:
+            code, body = self.slot_action("0", "save", name)
+        except Exception as e:  # noqa: BLE001 - an engine that died or fell silent: nothing saved, the stop goes on
+            code, body = 500, {"error": {"message": str(e)}}
+        if code == 200:
+            return (f"saved the session for the next start: {body['n_saved']} tokens, {body['n_written']} bytes in "
+                    f"{body['timings']['save_ms']:.0f} ms ({name})")
+        why = body["error"]["message"]
+        if body["error"].get("published"):
+            return f"the session for the next start was written but its save failed: {why} ({name})"
+        try:
+            os.unlink(os.path.join(self.slot_save_path, name))
+            gone = "; the session an earlier stop saved is removed"
+        except FileNotFoundError:
+            gone = ""
+        except OSError as e:
+            gone = f"; the session an earlier stop saved could not be removed: {e}"
+        return f"no session saved for the next start: {why}{gone}"
+
+    def restore_stop_session(self) -> str:
+        """--stop-session: the session the last stop saved, restored into the slot before the first request, so a
+        conversation that continues it reuses its state instead of reading its prompt again.  The file stays: it is
+        what the slot held at the last stop until the next stop replaces it.  -> one line ("" when off); never raises."""
+        name = self.stop_session
+        if not name or not self.slot_save_path:
+            return ""
+        if not os.path.lexists(os.path.join(self.slot_save_path, name)):
+            return f"no session saved at the last stop ({name})"
+        if not self.loaded():
+            return f"the model is not loaded: the session saved at the last stop is not restored ({name})"
+        try:
+            code, body = self.slot_action("0", "restore", name)
+        except Exception as e:  # noqa: BLE001 - the server starts anyway; the next request starts a dead engine again
+            code, body = 500, {"error": {"message": str(e)}}
+        if code != 200:
+            return f"the session saved at the last stop is not restored: {body['error']['message']} ({name})"
+        return (f"restored the session saved at the last stop: {body['n_restored']} tokens in "
+                f"{body['timings']['restore_ms']:.0f} ms ({name})")
 
     def set_aliases(self, aliases) -> None:
         """#297: the config's `aliases` - a list of names (or one comma-separated string), like llama-server's --alias.
@@ -8207,6 +8293,9 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--stop-session", default=None, metavar="NAME",
+                    help="save the conversation the engine holds to DIR/NAME of --slot-save-path when the server is "
+                         "stopped, and restore it from there when it starts (also \"stop_session\" in the config)")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
                     help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
@@ -8215,7 +8304,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
     a = ap.parse_args(launch_args)
     if a.engine == "strata" and (_rt := rttime_limit_note()):   # #3238: say it before the first unexplained -9
         print("[strata] WARNING: " + _rt, flush=True)
-    global OPENS_BROWSER
+    global OPENS_BROWSER, ENGINE_IGNORES_TERM
     OPENS_BROWSER = bool(a.open)
     # Every ordinary way of being asked to stop takes Ctrl+C's path (QUIT to the engine, then exit): SIGTERM (#96 docker
     # stop; systemd), SIGHUP (the terminal closed, ssh dropped), and on Windows Ctrl+Break and the console's close,
@@ -8341,6 +8430,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
         if blocked:
             ap.error("--offline cannot be strict for this profile: " + "; ".join(blocked))
     lazy = False
+    try:
+        stop_session = stop_session_name(a.stop_session if a.stop_session is not None else cfg.get("stop_session"),
+                                         bool(a.slot_save_path or cfg.get("slot_save_path")))
+    except ValueError as e:
+        raise SystemExit(f"[strata] {e}")
+    ENGINE_IGNORES_TERM = stop_session is not None     # before the engine starts: its child is spawned with it
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -8547,6 +8642,7 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
             raise SystemExit(f"[strata] {e}")
         print(f"[strata] slot save/restore on: {svc.slot_save_path} (session files are kept until deleted: "
               "about 1.2 GB per 63K-token conversation; restore only files this server wrote)", flush=True)
+    svc.stop_session = stop_session
     mode = str(cfg.get("anthropic_thinking") or "model")   # #278: "on_request" = only when the request asks
     if mode not in ("model", "on_request"):
         raise SystemExit(f"[strata] config anthropic_thinking must be \"model\" or \"on_request\", not {mode!r}")
@@ -8613,6 +8709,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
               f"chat: {', '.join(hub.servers)}", flush=True)
         hub.start()
         atexit.register(hub.close)                      # the servers Strata started end with it
+    if svc.stop_session:                                # before the first request: it continues from here
+        print(f"[strata] {svc.restore_stop_session()}", flush=True)
     httpd = serve(svc, host=a.host, port=a.port)
     bound_port = httpd.server_address[1]               # --port 0: report the port the OS actually assigned
     svc.start_idle_unload()
@@ -8686,6 +8784,12 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 print(f"[strata] drain deadline expired; cancelling {cancelled} owned request(s) ...", flush=True)
                 svc.wait_for_drain(5)
                 drained = False
+        if interrupted and svc.stop_session:            # before the engine is closed: the live session outlives it
+            try:
+                said = svc.save_stop_session()
+            except KeyboardInterrupt:                   # a second Ctrl+C: end without saving
+                said = "the session was not saved for the next start: stopped at once"
+            print(f"[strata] {said}", flush=True)
         closers = [httpd.shutdown, getattr(engine, "close", None), vision.shutdown if vision else None,
                    hub.close if hub is not None else None]
         try:

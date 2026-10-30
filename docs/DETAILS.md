@@ -472,6 +472,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `api_monitor` | off | Records requests for `/api-monitor`. |
 | `lazy_load` | off | Start without loading the model. |
 | `slot_save_path` | none | Enables session files. |
+| `stop_session` | none | A session file name in `slot_save_path`: the live session is saved there when the server stops and restored when it starts. See [Session files](#session-files-disk). |
 | `host`, `api_key`, `cors_origins`, `trusted_origins`, `allowed_hosts` | local only | See [Network access](#network-access). |
 | `codex_thread_titles`, `codex_compaction_cache` | off | See [Codex CLI](#the-responses-api-and-codex-cli). |
 | `mcp_servers`, `mcp` | none | See [Tools from MCP servers](#tools-from-mcp-servers). |
@@ -676,6 +677,13 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   no room; `500` for other I/O failures or an engine that ended. `error.published: true` means a save failed after its new
   file had replaced the old one. Requests must be `application/json` (else `415`) and come from no browser page, Strata's own
   page or a trusted origin.
+- `--stop-session NAME` (or `"stop_session"` in the config, with a slot save path) keeps the conversation across a restart.
+  When the server is asked to stop (SIGTERM, SIGHUP, Ctrl+C), it admits no new request, cancels the running ones and saves the
+  live session to `DIR/NAME` before it ends the engine; when it starts, it restores `DIR/NAME` before it takes the first
+  request, so a conversation that continues it is not read again. A stop with nothing complete to save removes the earlier
+  file. The engine then ignores SIGTERM, so a stop sent to the whole unit (systemd's default `KillMode=control-group`)
+  reaches the server first; the engine still ends with the server. Give the unit's stop time for the save: about 1.2 GB per
+  63K-token conversation is written before the engine is let go.
 - Not supported with `--layer-split`, `--peer-device`, `--batch` or `--prompt-cache 0`. The engine has been run on Linux and CUDA
   only for this feature. Exact token replay across restarts is not guaranteed: expert residency and CPU/GPU rounding can
   change later output.
