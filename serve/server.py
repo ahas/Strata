@@ -115,6 +115,28 @@ ENGINE_IGNORES_TERM = False
 STOP_SAVE_DRAIN_S = 30.0
 
 
+def started_meanwhile(make):
+    """`make()` run on a thread of its own from now on.  -> a function that waits for it and returns what it made, or
+    raises what it raised."""
+    made: list = []
+
+    def run() -> None:
+        try:
+            made.append((True, make()))
+        except BaseException as e:  # noqa: BLE001 - raised again where it is waited for
+            made.append((False, e))
+    thread = threading.Thread(target=run, daemon=True, name="strata-start-meanwhile")
+    thread.start()
+
+    def wait():
+        thread.join()
+        ok, value = made[0]
+        if not ok:
+            raise value
+        return value
+    return wait
+
+
 def ignore_term() -> None:
     """In the engine's child, before exec: SIGTERM ignored, which the exec keeps."""
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -8467,8 +8489,10 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                 print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+            # the encoder starts beside the engine, so its start is not added to the engine's; it is waited for
+            # once the engine stands
+            vision = started_meanwhile(lambda: Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8")
+                                                      if cfg.get("log") else None, env=vision_env(cfg, env), lazy=lazy))
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
@@ -8518,6 +8542,8 @@ def main(argv=None, *, lifecycle_event=None, interrupt_exit_code: int = 0) -> in
                                  linux_desktop()) if not groups else None
         if note:                                        # #560 #516: before --open starts a browser on that card
             print(note, flush=True)
+        if vision is not None:
+            vision = vision()
     else:
         effort_end = None
         engine, vision, sampling_defaults = MockEngine(tok, a.script or [

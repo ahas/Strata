@@ -41,6 +41,25 @@ class RecordingEngine(MockEngine):
         yield from super().generate(ids, max_new, sampling, cancel, embeddings)
 
 
+class StartedMeanwhile(unittest.TestCase):
+    """What starts beside the engine (the picture reader) is waited for after it: its result, or what it raised."""
+
+    def test_the_result_is_waited_for_and_returned(self):
+        import serve.server as server
+        began = threading.Event()
+        wait = server.started_meanwhile(lambda: (began.set(), time.sleep(0.05), "reader")[2])
+        self.assertTrue(began.wait(5))
+        self.assertEqual(wait(), "reader")
+
+    def test_what_it_raised_is_raised_where_it_is_waited_for(self):
+        def fail():
+            raise RuntimeError("the vision encoder did not start")
+        import serve.server as server
+        wait = server.started_meanwhile(fail)
+        with self.assertRaisesRegex(RuntimeError, "did not start"):
+            wait()
+
+
 class MaxTokens(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
